@@ -1,3 +1,4 @@
-streamlit
-geopandas
-shapely
+streamlit>=1.43,<2
+geopandas>=1.0,<2
+shapely>=2.0,<3
+pyogrio>=0.9,<1

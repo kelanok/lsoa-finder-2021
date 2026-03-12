@@ -1,136 +1,121 @@
-import streamlit as st
+from pathlib import Path
+import tempfile
+
 import geopandas as gpd
+import streamlit as st
 from shapely.geometry import Point
-import os # Import the os module to check for files
 
-# --- Page Setup ---
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_FILE_PATH = APP_DIR / "data.gpkg"
+WGS84_CRS = "EPSG:4326"
+BNG_CRS = "EPSG:27700"
+REQUIRED_COLUMN = "LSOA21CD"
+
+
 st.set_page_config(page_title="LSOA Finder", layout="wide")
-st.title("LSOA Finder 🗺️")
-st.write("Find LSOAs where the population-weighted centroid falls within a given radius.")
-
-# --- File Configuration ---
-# The default local file to look for
-DEFAULT_FILE_NAME = "data.gpkg"
-
-# --- Caching the Data Loader ---
-@st.cache_data
-def load_data(file_path_or_buffer):
-    """
-    Loads and pre-processes the GeoPackage file.
-    The input can be a file path (str) or an uploaded file buffer.
-    """
-    st.write("Cache miss: Loading and processing LSOA data... (this runs once)")
-    
-    BNG_CRS = "EPSG:27700"
-    
-    try:
-        # gpd.read_file() can handle both file paths and uploaded file objects
-        gpd_df = gpd.read_file(file_path_or_buffer)
-        
-        # Ensure data is in the correct CRS
-        if gpd_df.crs != BNG_CRS:
-            gpd_df = gpd_df.to_crs(BNG_CRS)
-            
-        # Check for required column
-        if 'LSOA21CD' not in gpd_df.columns:
-            st.error("Error: 'LSOA21CD' column not found in the file.")
-            return None
-            
-        return gpd_df
-        
-    except Exception as e:
-        st.error(f"Error loading file: {e}")
-        return None
-
-# --- Core Logic Function ---
-def find_lsoas(lat, lon, radius_km, lsoa_data_gdf):
-    """Finds LSOAs using the pre-loaded GeoDataFrame."""
-    
-    WGS_CRS = "EPSG:4326"
-    BNG_CRS = "EPSG:27700"
-    
-    lsoa_centroids_gdf = lsoa_data_gdf.copy()
-
-    # Create and transform the target point
-    site_point_geom = Point(lon, lat)
-    site_point_gdf = gpd.GeoDataFrame([{'geometry': site_point_geom}], crs=WGS_CRS)
-    site_point_in_bng = site_point_gdf.to_crs(BNG_CRS)
-    site_point = site_point_in_bng.geometry.iloc[0]
-
-    # Calculate distances
-    radius_meters = radius_km * 1000.0
-    lsoa_centroids_gdf['distance'] = lsoa_centroids_gdf.geometry.distance(site_point)
-
-    # Filter
-    matching_lsoas = lsoa_centroids_gdf[
-        lsoa_centroids_gdf['distance'] <= radius_meters
-    ]
-
-    return sorted(list(matching_lsoas['LSOA21CD'].unique()))
-
-# --- Sidebar Inputs ---
-st.sidebar.header("Inputs")
-
-# 1. File Uploader (now optional)
-uploaded_file = st.sidebar.file_uploader(
-    "Upload File (Optional)", 
-    type=["gpkg", "shp", "geojson"],
-    help=f"If no file is uploaded, the app will automatically use '{DEFAULT_FILE_NAME}' if it's in the same directory."
+st.title("LSOA Finder")
+st.write(
+    "Find LSOAs whose population-weighted centroids fall within a chosen radius "
+    "of a target latitude and longitude."
 )
 
-# 2. Coordinates and Radius
-lat = st.sidebar.text_input("Target Latitude", "52.5844")
-lon = st.sidebar.text_input("Target Longitude", "-2.1320")
-radius_m = st.sidebar.number_input("Radius (in metres)", min_value=1, value=1500, step=100)
 
-# --- Main App Logic: Determine which file to load ---
+@st.cache_data(show_spinner="Loading LSOA data...")
+def load_data(source_key: str, uploaded_bytes: bytes | None = None) -> gpd.GeoDataFrame:
+    if uploaded_bytes is None:
+        data = gpd.read_file(source_key)
+    else:
+        suffix = Path(source_key).suffix or ".gpkg"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(uploaded_bytes)
+            temp_path = temp_file.name
+        data = gpd.read_file(temp_path)
 
-file_to_load = None
-data_source_message = ""
+    if data.crs is None:
+        raise ValueError("The uploaded file has no coordinate reference system.")
+
+    if data.crs != BNG_CRS:
+        data = data.to_crs(BNG_CRS)
+
+    if REQUIRED_COLUMN not in data.columns:
+        raise ValueError(f"Required column '{REQUIRED_COLUMN}' was not found.")
+
+    return data[[REQUIRED_COLUMN, "geometry"]].copy()
+
+
+def find_lsoas(lat: float, lon: float, radius_m: float, lsoa_data_gdf: gpd.GeoDataFrame) -> list[str]:
+    site_point = gpd.GeoDataFrame(
+        [{"geometry": Point(lon, lat)}],
+        crs=WGS84_CRS,
+    ).to_crs(BNG_CRS).geometry.iloc[0]
+
+    distances = lsoa_data_gdf.geometry.distance(site_point)
+    matches = lsoa_data_gdf.loc[distances <= radius_m, REQUIRED_COLUMN]
+    return sorted(matches.unique().tolist())
+
+
+st.sidebar.header("Inputs")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload centroid data (optional)",
+    type=["gpkg", "geojson"],
+    help=(
+        "If nothing is uploaded, the app uses the bundled data.gpkg file. "
+        "GeoPackage and GeoJSON are supported for Streamlit deployment."
+    ),
+)
+lat_text = st.sidebar.text_input("Target latitude", "52.5844")
+lon_text = st.sidebar.text_input("Target longitude", "-2.1320")
+radius_m = st.sidebar.number_input("Radius (metres)", min_value=1, value=1500, step=100)
+
+file_label: str | None = None
+source_key: str | None = None
+uploaded_bytes: bytes | None = None
 
 if uploaded_file is not None:
-    # Priority 1: User uploaded a file
-    file_to_load = uploaded_file
-    data_source_message = f"Using uploaded file: `{uploaded_file.name}`"
-elif os.path.exists(DEFAULT_FILE_NAME):
-    # Priority 2: Default file exists
-    file_to_load = DEFAULT_FILE_NAME
-    data_source_message = f"Using default file: `{DEFAULT_FILE_NAME}`"
+    source_key = uploaded_file.name
+    uploaded_bytes = uploaded_file.getvalue()
+    file_label = f"Using uploaded file: `{uploaded_file.name}`"
+elif DEFAULT_FILE_PATH.exists():
+    source_key = str(DEFAULT_FILE_PATH)
+    file_label = f"Using bundled file: `{DEFAULT_FILE_PATH.name}`"
 else:
-    # State 3: No data
-    st.info(f"Please upload your LSOA Centroids file, or place `{DEFAULT_FILE_NAME}` in the app's directory to begin.")
+    st.error(
+        "No input data is available. Upload a GeoPackage or GeoJSON file, "
+        "or add `data.gpkg` to the app root."
+    )
 
+if file_label:
+    st.sidebar.success(file_label)
 
-# --- Run the App if we have data ---
-if file_to_load is not None:
-    st.sidebar.success(data_source_message)
-    
-    # Load data (will be cached based on the file source)
-    lsoa_gdf = load_data(file_to_load)
-    
-    if lsoa_gdf is not None:
-        
-        # 3. Run Button
-        if st.sidebar.button("Find LSOAs"):
-            try:
-                # Validate inputs
-                lat_f = float(lat)
-                lon_f = float(lon)
-                radius_km_f = float(radius_m) / 1000.0
+if source_key:
+    try:
+        lsoa_gdf = load_data(source_key, uploaded_bytes)
+    except Exception as exc:
+        st.error(f"Unable to load the LSOA data: {exc}")
+        st.stop()
 
-                # Run calculation
-                with st.spinner("Calculating..."):
-                    lsoa_list = find_lsoas(lat_f, lon_f, radius_km_f, lsoa_gdf)
+    if st.sidebar.button("Find LSOAs", type="primary"):
+        try:
+            lat = float(lat_text)
+            lon = float(lon_text)
+        except ValueError:
+            st.error("Latitude and longitude must both be valid numbers.")
+            st.stop()
 
-                # Display Results
-                st.header("Results")
-                st.success(f"Found {len(lsoa_list)} LSOAs with centroids in the radius.")
-                
-                # Put results in a neat text area
-                results_text = "\n".join(lsoa_list)
-                st.text_area("LSOA Codes", results_text, height=300)
+        with st.spinner("Calculating LSOAs..."):
+            lsoa_list = find_lsoas(lat, lon, float(radius_m), lsoa_gdf)
 
-            except ValueError:
-                st.error("Invalid Input: Latitude and Longitude must be valid numbers.")
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+        st.header("Results")
+        st.success(f"Found {len(lsoa_list)} matching LSOAs.")
+
+        if lsoa_list:
+            results_text = "\n".join(lsoa_list)
+            st.text_area("LSOA codes", results_text, height=320)
+            st.download_button(
+                "Download results",
+                data=results_text,
+                file_name="lsoa_results.txt",
+                mime="text/plain",
+            )
+        else:
+            st.info("No LSOAs were found within the selected radius.")
